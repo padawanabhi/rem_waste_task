@@ -18,6 +18,7 @@ from speechbrain.pretrained import EncoderClassifier
 import math
 import pandas as pd
 import logging
+import shutil
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
@@ -39,7 +40,7 @@ def download_and_extract_audio(url, output_audio_path):
         logging.info(f"Files in tmpdir: {os.listdir(tmpdir)}")
         for fname in os.listdir(tmpdir):
             if fname.endswith(".wav"):
-                os.rename(os.path.join(tmpdir, fname), output_audio_path)
+                shutil.copyfile(os.path.join(tmpdir, fname), output_audio_path)
                 return output_audio_path
         logging.error("yt-dlp did not produce a .wav file")
         raise RuntimeError("yt-dlp did not produce a .wav file")
