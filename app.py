@@ -38,10 +38,20 @@ import numpy as np
 import soundfile as sf
 from speechbrain.pretrained import EncoderClassifier
 import pandas as pd
+import yt_dlp
 
 # -----------------------------
 # Utility Functions
 # -----------------------------
+
+def get_video_duration(url: str) -> float:
+    """
+    Uses yt_dlp to get the duration of a video in seconds without downloading it.
+    """
+    ydl_opts = {}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return info.get('duration', 0)
 
 def download_and_extract_audio(url: str, output_audio_path: str) -> str:
     """
@@ -70,12 +80,37 @@ def download_and_extract_audio(url: str, output_audio_path: str) -> str:
         logging.error("yt-dlp did not produce a .wav file")
         raise RuntimeError("yt-dlp did not produce a .wav file")
 
-def transcribe_and_check_english(audio_path: str) -> Tuple[str, str]:
+def clip_audio(input_path: str, output_path: str, duration: int = 60) -> None:
+    """
+    Clips the input audio file to the first 'duration' seconds using ffmpeg.
+    """
+    command = [
+        'ffmpeg', '-y', '-i', input_path, '-t', str(duration), output_path
+    ]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        logging.error(f"ffmpeg failed: {result.stderr.decode()}")
+        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode()}")
+
+@st.cache_resource(show_spinner=False)
+def load_whisper_model() -> whisper.Whisper:
+    """
+    Loads the Whisper model and caches it for the Streamlit session.
+    """
+    return whisper.load_model('base')
+
+@st.cache_resource(show_spinner=False)
+def load_accent_classifier() -> EncoderClassifier:
+    """
+    Loads the SpeechBrain accent classifier and caches it for the Streamlit session.
+    """
+    return EncoderClassifier.from_hparams(source="Jzuluaga/accent-id-commonaccent_ecapa")
+
+def transcribe_and_check_english(audio_path: str, model: whisper.Whisper) -> Tuple[str, str]:
     """
     Transcribes the given audio file using OpenAI Whisper and detects the language.
     Returns the transcription text and the detected language code.
     """
-    model = whisper.load_model('base')
     result = model.transcribe(audio_path)
     text: str = result['text']
     lang: str = result['language']
@@ -114,12 +149,35 @@ video_url: str = st.text_input('Enter a public video URL (YouTube, Loom, direct 
 
 feedback: str = None
 
+# Maximum duration (in seconds) to process
+MAX_DURATION = 120
+
 if st.button('Analyze Accent') and video_url:
+    # Step 0: Check video duration
+    with st.spinner('Checking video duration...'):
+        try:
+            duration: float = get_video_duration(video_url)
+        except Exception as e:
+            logging.error(f"Error getting video duration: {e}")
+            st.error(f"Error getting video duration: {e}")
+            st.stop()
+    if duration > MAX_DURATION:
+        st.warning(f"Video is too long ({duration:.0f} seconds). Only the first {MAX_DURATION} seconds will be analyzed.")
+    else:
+        st.info(f"Video duration: {duration:.0f} seconds.")
+
     # Step 1: Download and extract audio
     with st.spinner('Processing video and extracting audio...'):
         try:
             audio_path: str = download_and_extract_audio(video_url, "audio.wav")
-            wav_16k_path: str = ensure_wav_16k_mono(audio_path)
+            # If video is too long, clip the audio
+            if duration > MAX_DURATION:
+                clipped_audio_path = "audio_clipped.wav"
+                clip_audio(audio_path, clipped_audio_path, duration=MAX_DURATION)
+                wav_16k_path: str = ensure_wav_16k_mono(clipped_audio_path)
+                os.unlink(audio_path)
+            else:
+                wav_16k_path: str = ensure_wav_16k_mono(audio_path)
         except Exception as e:
             logging.error(f"Error extracting audio: {e}")
             st.error(f"Error extracting audio: {e}")
@@ -130,9 +188,10 @@ if st.button('Analyze Accent') and video_url:
     # Step 2: Transcribe and check language
     with st.spinner('Transcribing and detecting language...'):
         try:
+            whisper_model = load_whisper_model()
             transcription: str
             lang: str
-            transcription, lang = transcribe_and_check_english(wav_16k_path)
+            transcription, lang = transcribe_and_check_english(wav_16k_path, whisper_model)
             is_english: bool = (lang == 'en')
             lang_status: str = "English" if is_english else f"Not English (detected: {lang})"
             st.markdown(f"**Detected Language:** {lang_status}")
@@ -145,7 +204,7 @@ if st.button('Analyze Accent') and video_url:
     if is_english:
         with st.spinner('Detecting accent...'):
             try:
-                classifier: EncoderClassifier = EncoderClassifier.from_hparams(source="Jzuluaga/accent-id-commonaccent_ecapa")
+                classifier: EncoderClassifier = load_accent_classifier()
                 prediction = classifier.classify_file(wav_16k_path)
                 accent_labels: list[str] = list(classifier.hparams.label_encoder.lab2ind.keys())
                 probs: np.ndarray = prediction[0].detach().cpu().numpy().flatten()
@@ -187,7 +246,10 @@ if st.button('Analyze Accent') and video_url:
         st.write(transcription)
 
     # Step 5: Clean up temp audio file
-    os.unlink(audio_path)
+    if os.path.exists("audio.wav"):
+        os.unlink("audio.wav")
+    if os.path.exists("audio_clipped.wav"):
+        os.unlink("audio_clipped.wav")
 
     # Step 6: Feedback option
     st.markdown("---")
